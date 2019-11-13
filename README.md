@@ -28,9 +28,6 @@ Wishlisted features:
     - http://coded.io/blog
       match all https requests going to https://coded.io/blog (and all sub-paths).
       This will additionally handle redirecting from http to https.
-    - tcp://:80/SSH-2.0
-      match all tcp connections on port 80 beginning with a magic string of SSH-2.0.
-      Note that this can be used in conjunction with http handlers.
 
 - `rproxy.backend`
     - http://:8000
