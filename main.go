@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"log"
 	"net"
 	"net/http"
@@ -12,18 +13,35 @@ import (
 func main() {
 	log.Println("Starting rproxy")
 
-	fallbackChan := make(chan net.Conn)
+	server := NewServer()
+	err := server.Run(context.Background())
+	if err != nil {
+		log.Fatalln(err)
+	}
+}
 
-	l, err := net.Listen("tcp", ":8000")
+func leftovers() {
+	httpListener, err := net.Listen("tcp", ":80")
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	httpListener := newProxyListener(l.Addr(), fallbackChan)
-	go http.Serve(httpListener, http.FileServer(http.Dir(".")))
+	/*
+		httpsListener, err := tls.Listen("tcp", ":443", cfg.TLSConfig())
+		if err != nil {
+			log.Fatalln(err)
+		}
+	*/
+
+	fallbackChan := make(chan net.Conn)
+
+	httpProxyListener := newProxyListener(httpListener.Addr(), fallbackChan)
+	go http.Serve(
+		httpProxyListener,
+		http.FileServer(http.Dir(".")))
 
 	for {
-		c, err := l.Accept()
+		c, err := httpListener.Accept()
 		if err != nil {
 			log.Fatalln(err)
 		}
@@ -46,7 +64,7 @@ func main() {
 			}
 
 			if bytes.HasPrefix(data, []byte("SSH-2.0")) {
-				handleTCPProxy(wrapped)
+				handleTCPProxy(wrapped, "localhost:2222")
 			} else {
 				fallbackChan <- wrapped
 			}
@@ -54,11 +72,10 @@ func main() {
 	}
 }
 
-func handleTCPProxy(c net.Conn) {
+func handleTCPProxy(c net.Conn, remoteAddr string) {
 	defer c.Close()
 
-	addr, _ := net.ResolveTCPAddr("tcp", "localhost:2222")
-	serv, err := net.DialTCP("tcp", nil, addr)
+	serv, err := net.Dial("tcp", remoteAddr)
 	if err != nil {
 		log.Println(err)
 		return
