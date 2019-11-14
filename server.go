@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"sync"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
@@ -95,14 +97,21 @@ func (s *Server) runDocker(ctx context.Context) error {
 				return err
 			}
 
+			frontendConfig, frontendOk := container.Config.Labels["rproxy.frontend"]
+			backendConfig, backendOk := container.Config.Labels["rproxy.backend"]
+
+			if !(frontendOk && backendOk) {
+				continue
+			}
+
 			if container.Config != nil {
-				frontendURL, err := url.Parse(container.Config.Labels["rproxy.frontend"])
+				frontendURL, err := url.Parse(frontendConfig)
 				if err != nil {
 					log.Println(err)
 					continue
 				}
 
-				backendURL, err := url.Parse(container.Config.Labels["rproxy.backend"])
+				backendURL, err := url.Parse(backendConfig)
 				if err != nil {
 					log.Println(err)
 					continue
@@ -114,10 +123,10 @@ func (s *Server) runDocker(ctx context.Context) error {
 						Frontend: frontendURL,
 						Backend:  backendURL,
 					}
-					s.regenerateHandler()
+					s.regenerateHandler(ctx)
 				} else if event.Action == "stop" {
 					delete(s.containers, container.ID)
-					s.regenerateHandler()
+					s.regenerateHandler(ctx)
 				}
 				s.lock.Unlock()
 			} else {
@@ -131,13 +140,26 @@ func (s *Server) runDocker(ctx context.Context) error {
 	}
 }
 
-func (s *Server) regenerateHandler() {
+func (s *Server) regenerateHandler(ctx context.Context) {
 	mux := http.NewServeMux()
 
 	for _, def := range s.containers {
+		spew.Dump(def)
+
+		_ = s.cfg.ManageAsync(ctx, []string{def.Frontend.Hostname()})
+
+		proxyHandler := httputil.NewSingleHostReverseProxy(def.Backend)
+		director := proxyHandler.Director
+		proxyHandler.Director = func(req *http.Request) {
+			req.URL.Path = strings.TrimPrefix(req.URL.Path, strings.TrimSuffix(def.Frontend.Path, "/"))
+			log.Println("Before:", req.URL)
+			director(req)
+			log.Println("After:", req.URL)
+		}
+
 		mux.Handle(
-			def.Frontend.Hostname()+def.Frontend.Path,
-			httputil.NewSingleHostReverseProxy(def.Backend),
+			def.Frontend.Hostname()+def.Frontend.Path+"/",
+			proxyHandler,
 		)
 	}
 

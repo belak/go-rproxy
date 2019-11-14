@@ -8,10 +8,20 @@ import (
 	"net"
 	"net/http"
 	"sync"
+
+	"github.com/mholt/certmagic"
 )
 
 func main() {
 	log.Println("Starting rproxy")
+
+	//certmagic.Default.CA = certmagic.LetsEncryptCA
+	certmagic.Default.Agreed = true
+	certmagic.Default.Email = "kaleb@coded.io"
+
+	certmagic.Default.Storage = &certmagic.FileStorage{
+		Path: "/srv/rproxy",
+	}
 
 	server := NewServer()
 	err := server.Run(context.Background())
