@@ -6,6 +6,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"sync"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/events"
@@ -15,12 +18,22 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+type proxyDefinition struct {
+	Frontend *url.URL
+	Backend  *url.URL
+}
+
 var HTTPSUpgradeHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "https://"+r.URL.Host+"/"+r.URL.Path, http.StatusMovedPermanently)
+	http.Redirect(w, r, "https://"+r.Host+r.URL.Path, http.StatusMovedPermanently)
 })
 
 type Server struct {
 	cfg *certmagic.Config
+
+	// Mapping of container ID to a proxy definition
+	containers  map[string]proxyDefinition
+	hostHandler http.Handler
+	lock        sync.RWMutex
 }
 
 func NewServer() *Server {
@@ -28,6 +41,9 @@ func NewServer() *Server {
 
 	return &Server{
 		cfg,
+		make(map[string]proxyDefinition),
+		http.NewServeMux(),
+		sync.RWMutex{},
 	}
 }
 
@@ -80,9 +96,30 @@ func (s *Server) runDocker(ctx context.Context) error {
 			}
 
 			if container.Config != nil {
-				log.Println(container.ID, event.Actor.ID)
-				log.Println(container.Config.Labels["rproxy.frontend"])
-				log.Println(container.Config.Labels["rproxy.backend"])
+				frontendURL, err := url.Parse(container.Config.Labels["rproxy.frontend"])
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+
+				backendURL, err := url.Parse(container.Config.Labels["rproxy.backend"])
+				if err != nil {
+					log.Println(err)
+					continue
+				}
+
+				s.lock.Lock()
+				if event.Action == "start" {
+					s.containers[container.ID] = proxyDefinition{
+						Frontend: frontendURL,
+						Backend:  backendURL,
+					}
+					s.regenerateHandler()
+				} else if event.Action == "stop" {
+					delete(s.containers, container.ID)
+					s.regenerateHandler()
+				}
+				s.lock.Unlock()
 			} else {
 				log.Println("nil container config")
 			}
@@ -92,6 +129,19 @@ func (s *Server) runDocker(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+func (s *Server) regenerateHandler() {
+	mux := http.NewServeMux()
+
+	for _, def := range s.containers {
+		mux.Handle(
+			def.Frontend.Hostname()+def.Frontend.Path,
+			httputil.NewSingleHostReverseProxy(def.Backend),
+		)
+	}
+
+	s.hostHandler = mux
 }
 
 func (s *Server) runHTTP(ctx context.Context) error {
@@ -132,8 +182,8 @@ func (s *Server) runHTTPS(ctx context.Context) error {
 	// The http server only handles HTTP challenges and upgrades http to
 	// https.
 	server := &http.Server{
-		Addr:    ":80",
-		Handler: s.cfg.HTTPChallengeHandler(HTTPSUpgradeHandler),
+		Addr:    ":443",
+		Handler: s.cfg.HTTPChallengeHandler(http.HandlerFunc(s.handler)),
 	}
 
 	var errChan = make(chan error, 1)
@@ -149,4 +199,11 @@ func (s *Server) runHTTPS(ctx context.Context) error {
 	}
 
 	return err
+}
+
+func (s *Server) handler(w http.ResponseWriter, r *http.Request) {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+
+	s.hostHandler.ServeHTTP(w, r)
 }
